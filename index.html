@@ -147,18 +147,27 @@ dialog::backdrop{background:rgba(0,0,0,.5)}
 .lock-card .row .btn{flex:1}
 .lock-setup{margin:14px 0 0;font-size:13px}
 .lock-setup a{color:var(--teal);font-weight:700;text-decoration:none}
+#googleBtn{width:100%;padding:13px;font-size:15px}
+.pin-fallback{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+.pin-fallback summary{cursor:pointer;font-size:13.5px;font-weight:700;color:var(--teal);list-style:none}
+.pin-fallback summary::-webkit-details-marker{display:none}
 </style>
 </head>
 <body>
 <div class="lock-overlay" id="lockOverlay">
   <div class="lock-card">
     <h2>🔒 Video Inventory HUB</h2>
-    <p id="lockMsg">This HUB is private. Enter your PIN to unlock it.</p>
-    <input id="pinInput" type="password" inputmode="numeric" autocomplete="off" placeholder="••••" maxlength="32" aria-label="PIN">
+    <p>This HUB is private. Sign in to unlock it.</p>
+    <button class="btn primary" id="googleBtn">Continue with Google</button>
     <div class="lock-err" id="lockErr"></div>
-    <label class="lock-trust"><input type="checkbox" id="trustDevice"> Trust this device (stay unlocked)</label>
-    <div class="row"><button class="btn primary" id="unlockBtn">Unlock</button></div>
-    <p class="lock-setup"><a href="#" id="setupPinLink">First time? Set up your PIN →</a></p>
+    <details class="pin-fallback">
+      <summary>Use a PIN instead</summary>
+      <p id="lockMsg" style="margin-top:12px">Enter your PIN to unlock it.</p>
+      <input id="pinInput" type="password" inputmode="numeric" autocomplete="off" placeholder="••••" maxlength="32" aria-label="PIN">
+      <label class="lock-trust"><input type="checkbox" id="trustDevice"> Trust this device (stay unlocked)</label>
+      <div class="row"><button class="btn primary" id="unlockBtn">Unlock</button></div>
+      <p class="lock-setup"><a href="#" id="setupPinLink">First time? Set up your PIN →</a></p>
+    </details>
   </div>
 </div>
 <div class="wrap">
@@ -565,22 +574,20 @@ try{
 }catch(e){db=null;}
 
 /* ---- Private access lock (PIN unlocks your private database) ---- */
-function initCloud(docId){
+function initCloud(collection,docId){
   if(cloudStarted||!db)return;cloudStarted=true;
   setSync("syncing","Connecting…");
-  firebase.auth().signInAnonymously().then(function(){
-    cloudDoc=db.collection("hubs").doc(docId);
-    cloudDoc.onSnapshot(function(snap){
-      if(dirty){saveCloud();return;} // local edits pending: push ours instead of taking theirs
-      if(snap.exists()){
-        var d=snap.data()||{};
-        if(Array.isArray(d.videos)){videos=d.videos;nextId=d.nextId||(maxId()+1);render();}
-      }else{
-        saveCloud(); // first run: upload the starter inventory
-      }
-      setSync("synced","Synced ✓");
-    },function(){setSync("offline","Offline — changes stay on this device");});
-  }).catch(function(){setSync("offline","Offline — changes stay on this device");});
+  cloudDoc=db.collection(collection).doc(docId);
+  cloudDoc.onSnapshot(function(snap){
+    if(dirty){saveCloud();return;} // local edits pending: push ours instead of taking theirs
+    if(snap.exists()){
+      var d=snap.data()||{};
+      if(Array.isArray(d.videos)){videos=d.videos;nextId=d.nextId||(maxId()+1);render();}
+    }else{
+      saveCloud(); // first run: upload the starter inventory
+    }
+    setSync("synced","Synced ✓");
+  },function(){setSync("offline","Offline — changes stay on this device");});
 }
 var lockMode="unlock";
 function sha256hex(s){
@@ -607,8 +614,10 @@ function doUnlock(docId){
   try{
     sessionStorage.setItem("hubDoc",docId);
     if(document.getElementById("trustDevice").checked)localStorage.setItem("hubDoc",docId);
+    localStorage.removeItem("hubAuth");
   }catch(e){}
-  hideLock();initCloud(docId);toast("HUB unlocked 🔓");
+  hideLock();setSync("syncing","Connecting…");
+  firebase.auth().signInAnonymously().then(function(){initCloud("pin",docId);toast("HUB unlocked 🔓")}).catch(function(){lockError("Couldn't start a secure session — reload and try again")});
 }
 document.getElementById("setupPinLink").addEventListener("click",function(e){e.preventDefault();setLockMode(lockMode==="unlock"?"setup":"unlock")});
 document.getElementById("pinInput").addEventListener("keydown",function(e){if(e.key==="Enter")document.getElementById("unlockBtn").click()});
@@ -621,7 +630,7 @@ document.getElementById("unlockBtn").addEventListener("click",function(){
   sha256hex(pin).then(function(hash){
     var docId="p-"+hash;
     if(lockMode==="setup"){
-      db.collection("hubs").doc(docId).get().then(function(snap){
+      db.collection("pin").doc(docId).get().then(function(snap){
         if(snap.exists()){btn.disabled=false;lockError("That PIN is already in use — pick a different one");return}
         var mainRef=db.collection("hubs").doc("main");
         mainRef.get().then(function(mainSnap){
@@ -631,14 +640,14 @@ document.getElementById("unlockBtn").addEventListener("click",function(){
             payload.nextId=mainSnap.data().nextId||payload.nextId;
           }
           payload.updatedAt=firebase.firestore.FieldValue.serverTimestamp();
-          db.collection("hubs").doc(docId).set(payload).then(function(){
+          db.collection("pin").doc(docId).set(payload).then(function(){
             mainRef.delete().catch(function(){});
             btn.disabled=false;doUnlock(docId);
           }).catch(function(){btn.disabled=false;lockError("Couldn't save — check your connection")});
         }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
       }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
     }else{
-      db.collection("hubs").doc(docId).get().then(function(snap){
+      db.collection("pin").doc(docId).get().then(function(snap){
         btn.disabled=false;
         if(snap.exists())doUnlock(docId);
         else lockError("Wrong PIN — try again");
@@ -646,14 +655,58 @@ document.getElementById("unlockBtn").addEventListener("click",function(){
     }
   });
 });
+/* ---- Continue with Google ---- */
+var googleProvider=null;
+try{googleProvider=new firebase.auth.GoogleAuthProvider()}catch(e){}
+document.getElementById("googleBtn").addEventListener("click",function(){
+  if(!db||!googleProvider){lockError("Sign-in unavailable — check your connection and reload");return}
+  lockError("");
+  firebase.auth().signInWithRedirect(googleProvider);
+});
+function startGoogleVault(user){
+  var docId="u-"+user.uid;
+  var oldPinDoc=null;
+  try{
+    oldPinDoc=sessionStorage.getItem("hubDoc")||localStorage.getItem("hubDoc");
+    sessionStorage.removeItem("hubDoc");localStorage.removeItem("hubDoc");
+    localStorage.setItem("hubAuth","google");
+  }catch(e){}
+  hideLock();setSync("syncing","Connecting…");
+  function go(){initCloud("hubs",docId);toast("Signed in with Google ✓")}
+  if(oldPinDoc){
+    db.collection("pin").doc(oldPinDoc).get().then(function(snap){
+      if(snap.exists()&&Array.isArray(snap.data().videos)){
+        var d=snap.data();
+        db.collection("hubs").doc(docId).set({videos:d.videos,nextId:d.nextId||(maxId()+1),updatedAt:firebase.firestore.FieldValue.serverTimestamp()}).then(function(){
+          toast("Moved your vault to Google sign-in ✓");go();
+        }).catch(go);
+      }else go();
+    }).catch(go);
+  }else go();
+}
+try{
+  firebase.auth().onAuthStateChanged(function(user){
+    if(user&&!user.isAnonymous&&!cloudStarted)startGoogleVault(user);
+  });
+  firebase.auth().getRedirectResult().then(function(){},function(){lockError("Google sign-in didn't finish — please try again")});
+}catch(e){}
 document.getElementById("lockBtn").addEventListener("click",function(){
-  try{sessionStorage.removeItem("hubDoc");localStorage.removeItem("hubDoc")}catch(e){}
+  try{
+    sessionStorage.removeItem("hubDoc");localStorage.removeItem("hubDoc");
+    localStorage.removeItem("hubAuth");
+    firebase.auth().signOut().catch(function(){});
+  }catch(e){}
   location.reload();
 });
 (function(){
-  var remembered=null;
-  try{remembered=sessionStorage.getItem("hubDoc")||localStorage.getItem("hubDoc")}catch(e){}
-  if(remembered&&db){hideLock();initCloud(remembered)}
+  var remembered=null,authMode=null;
+  try{
+    remembered=sessionStorage.getItem("hubDoc")||localStorage.getItem("hubDoc");
+    authMode=localStorage.getItem("hubAuth");
+  }catch(e){}
+  if(!db)return;
+  if(authMode==="google"){setSync("syncing","Restoring sign-in…");return}
+  if(remembered){hideLock();initCloud("pin",remembered)}
 })();
 
 render();
