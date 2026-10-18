@@ -135,9 +135,32 @@ dialog::backdrop{background:rgba(0,0,0,.5)}
 .sync-pill.offline .dot{background:#ef4444}
 .sync-pill.syncing .dot{background:#f59e0b;animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.35}}
+.lock-overlay{position:fixed;inset:0;background:var(--bg);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px}
+.lock-card{background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:28px 24px;max-width:380px;width:100%;text-align:center}
+.lock-card h2{margin:0 0 8px;font-size:22px}
+.lock-card p{color:var(--muted);font-size:14px;line-height:1.55;margin:0 0 14px}
+.lock-card input[type=password]{width:100%;padding:13px;font-size:20px;text-align:center;letter-spacing:.3em;border:1px solid var(--line2);border-radius:12px;background:var(--surface2);color:var(--text);margin-bottom:6px;outline:none}
+.lock-card input[type=password]:focus{border-color:var(--prog-dot)}
+.lock-err{color:var(--red);font-size:13px;min-height:22px;margin:4px 0;font-weight:700}
+.lock-trust{display:flex;align-items:center;justify-content:center;gap:8px;font-size:13.5px;color:var(--muted);margin:2px 0 12px;cursor:pointer}
+.lock-card .row{display:flex;gap:8px}
+.lock-card .row .btn{flex:1}
+.lock-setup{margin:14px 0 0;font-size:13px}
+.lock-setup a{color:var(--teal);font-weight:700;text-decoration:none}
 </style>
 </head>
 <body>
+<div class="lock-overlay" id="lockOverlay">
+  <div class="lock-card">
+    <h2>🔒 Video Inventory HUB</h2>
+    <p id="lockMsg">This HUB is private. Enter your PIN to unlock it.</p>
+    <input id="pinInput" type="password" inputmode="numeric" autocomplete="off" placeholder="••••" maxlength="32" aria-label="PIN">
+    <div class="lock-err" id="lockErr"></div>
+    <label class="lock-trust"><input type="checkbox" id="trustDevice"> Trust this device (stay unlocked)</label>
+    <div class="row"><button class="btn primary" id="unlockBtn">Unlock</button></div>
+    <p class="lock-setup"><a href="#" id="setupPinLink">First time? Set up your PIN →</a></p>
+  </div>
+</div>
 <div class="wrap">
 
   <div class="top">
@@ -168,6 +191,7 @@ dialog::backdrop{background:rgba(0,0,0,.5)}
     <button class="btn" id="exportBtn">⬇ Export</button>
     <label class="btn" for="importFile" style="display:inline-block">⬆ Import</label>
     <input type="file" id="importFile" accept=".json,application/json" class="hidden">
+    <button class="btn" id="lockBtn" title="Lock the HUB">🔒 Lock</button>
   </div>
 
   <!-- Add / Edit panel -->
@@ -510,7 +534,7 @@ document.getElementById("importFile").addEventListener("change",function(e){
 });
 
 /* ---- Cloud database (Firebase: same inventory on every device) ---- */
-var cloudDoc=null, saveTimer=null, dirty=false;
+var cloudDoc=null, saveTimer=null, dirty=false, db=null, cloudStarted=false;
 function setSync(state,text){
   var pill=document.getElementById("syncPill");
   if(!pill)return;
@@ -537,10 +561,15 @@ try{
     messagingSenderId:"307687553762",
     appId:"1:307687553762:web:0aca59feb878ad0ceabcbb"
   });
-  var db=firebase.firestore();
+  db=firebase.firestore();
+}catch(e){db=null;}
+
+/* ---- Private access lock (PIN unlocks your private database) ---- */
+function initCloud(docId){
+  if(cloudStarted||!db)return;cloudStarted=true;
   setSync("syncing","Connecting…");
   firebase.auth().signInAnonymously().then(function(){
-    cloudDoc=db.collection("hubs").doc("main");
+    cloudDoc=db.collection("hubs").doc(docId);
     cloudDoc.onSnapshot(function(snap){
       if(dirty){saveCloud();return;} // local edits pending: push ours instead of taking theirs
       if(snap.exists()){
@@ -552,7 +581,80 @@ try{
       setSync("synced","Synced ✓");
     },function(){setSync("offline","Offline — changes stay on this device");});
   }).catch(function(){setSync("offline","Offline — changes stay on this device");});
-}catch(e){setSync("offline","Sync unavailable");}
+}
+var lockMode="unlock";
+function sha256hex(s){
+  return crypto.subtle.digest("SHA-256",new TextEncoder().encode("video-hub:"+s)).then(function(buf){
+    return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0")}).join("");
+  });
+}
+function lockError(m){document.getElementById("lockErr").textContent=m}
+function setLockMode(m){
+  lockMode=m;lockError("");document.getElementById("pinInput").value="";
+  if(m==="setup"){
+    document.getElementById("lockMsg").textContent="Choose a PIN (4+ characters — longer is safer). Write it down: it's the only key to your HUB.";
+    document.getElementById("unlockBtn").textContent="Set PIN & Unlock";
+    document.getElementById("setupPinLink").textContent="← Back to unlock";
+  }else{
+    document.getElementById("lockMsg").textContent="This HUB is private. Enter your PIN to unlock it.";
+    document.getElementById("unlockBtn").textContent="Unlock";
+    document.getElementById("setupPinLink").textContent="First time? Set up your PIN →";
+  }
+  document.getElementById("pinInput").focus();
+}
+function hideLock(){document.getElementById("lockOverlay").style.display="none"}
+function doUnlock(docId){
+  try{
+    sessionStorage.setItem("hubDoc",docId);
+    if(document.getElementById("trustDevice").checked)localStorage.setItem("hubDoc",docId);
+  }catch(e){}
+  hideLock();initCloud(docId);toast("HUB unlocked 🔓");
+}
+document.getElementById("setupPinLink").addEventListener("click",function(e){e.preventDefault();setLockMode(lockMode==="unlock"?"setup":"unlock")});
+document.getElementById("pinInput").addEventListener("keydown",function(e){if(e.key==="Enter")document.getElementById("unlockBtn").click()});
+document.getElementById("unlockBtn").addEventListener("click",function(){
+  if(!db){lockError("Database unavailable — check your connection and reload");return}
+  var pin=document.getElementById("pinInput").value;
+  if(pin.length<4){lockError("PIN needs at least 4 characters");return}
+  var btn=document.getElementById("unlockBtn");btn.disabled=true;lockError("");
+  var trusted=document.getElementById("trustDevice").checked;
+  sha256hex(pin).then(function(hash){
+    var docId="p-"+hash;
+    if(lockMode==="setup"){
+      db.collection("hubs").doc(docId).get().then(function(snap){
+        if(snap.exists()){btn.disabled=false;lockError("That PIN is already in use — pick a different one");return}
+        var mainRef=db.collection("hubs").doc("main");
+        mainRef.get().then(function(mainSnap){
+          var payload={videos:videos,nextId:nextId};
+          if(mainSnap.exists()&&Array.isArray(mainSnap.data().videos)){
+            payload.videos=mainSnap.data().videos;
+            payload.nextId=mainSnap.data().nextId||payload.nextId;
+          }
+          payload.updatedAt=firebase.firestore.FieldValue.serverTimestamp();
+          db.collection("hubs").doc(docId).set(payload).then(function(){
+            mainRef.delete().catch(function(){});
+            btn.disabled=false;doUnlock(docId);
+          }).catch(function(){btn.disabled=false;lockError("Couldn't save — check your connection")});
+        }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
+      }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
+    }else{
+      db.collection("hubs").doc(docId).get().then(function(snap){
+        btn.disabled=false;
+        if(snap.exists())doUnlock(docId);
+        else lockError("Wrong PIN — try again");
+      }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
+    }
+  });
+});
+document.getElementById("lockBtn").addEventListener("click",function(){
+  try{sessionStorage.removeItem("hubDoc");localStorage.removeItem("hubDoc")}catch(e){}
+  location.reload();
+});
+(function(){
+  var remembered=null;
+  try{remembered=sessionStorage.getItem("hubDoc")||localStorage.getItem("hubDoc")}catch(e){}
+  if(remembered&&db){hideLock();initCloud(remembered)}
+})();
 
 render();
 </script>
