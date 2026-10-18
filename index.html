@@ -129,6 +129,12 @@ input,select,textarea{font-family:inherit;font-size:15px;color:var(--text)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 dialog{border:1px solid var(--line);border-radius:16px;background:var(--surface);color:var(--text);padding:22px;max-width:400px;width:calc(100vw - 32px)}
 dialog::backdrop{background:rgba(0,0,0,.5)}
+.sync-pill{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:700;color:var(--muted);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:6px 12px;margin-top:10px}
+.sync-pill .dot{width:9px;height:9px;border-radius:50%;background:#f59e0b;flex:none}
+.sync-pill.synced .dot{background:#22c55e}
+.sync-pill.offline .dot{background:#ef4444}
+.sync-pill.syncing .dot{background:#f59e0b;animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.35}}
 </style>
 </head>
 <body>
@@ -145,6 +151,7 @@ dialog::backdrop{background:rgba(0,0,0,.5)}
       <div class="stat prog"><b id="statProg">0</b><span>In Progress</span></div>
       <div class="stat done"><b id="statDone">0</b><span>Completed</span></div>
     </div>
+    <div class="sync-pill syncing" id="syncPill" title="Cloud database status"><span class="dot"></span><span id="syncText">Connecting…</span></div>
   </div>
 
   <div class="toolbar">
@@ -276,6 +283,9 @@ dialog::backdrop{background:rgba(0,0,0,.5)}
 
 <div class="toast" id="toast"></div>
 
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script>
 var videos = [
   {id:1, title:"LANDU Silk PLA Tri-Color Filament Review", desc:"Collab with LANDU — 2 spools on the way (Red/Yellow/Blue + Red/Gold/Purple Silk PLA). Genuine first-print experience, no fixed script. Put affiliate link in description + pinned comment after publish.", tags:["3d printing","filament review","landu","silk pla","makerworld"], platform:"both", type:"Review", status:"upcoming", date:"", url:""},
@@ -352,7 +362,7 @@ function render(){
 }
 function moveVideo(id,status){
   var v=videos.find(function(x){return x.id===id});if(!v)return;
-  v.status=status;render();
+  v.status=status;render();saveCloud();
   var names={upcoming:"Upcoming",progress:"In Progress",done:"Completed"};
   toast("Moved to "+names[status]+(status==="done"&&!v.url?" — add its live link when ready":""));
 }
@@ -394,7 +404,7 @@ function askDelete(id){
 document.getElementById("deleteCancel").addEventListener("click",function(){document.getElementById("deleteDialog").close()});
 document.getElementById("deleteConfirm").addEventListener("click",function(){
   videos=videos.filter(function(x){return x.id!==pendingDeleteId});
-  document.getElementById("deleteDialog").close();render();toast("Video deleted");
+  document.getElementById("deleteDialog").close();render();saveCloud();toast("Video deleted");
 });
 document.getElementById("newBtn").addEventListener("click",function(){closeForm();openForm();document.getElementById("fTitle").focus()});
 document.getElementById("cancelBtn").addEventListener("click",closeForm);
@@ -429,7 +439,7 @@ document.getElementById("videoForm").addEventListener("submit",function(e){
   }else{
     data.id=nextId++;videos.unshift(data);toast("Video added to "+({upcoming:"Upcoming",progress:"In Progress",done:"Completed"})[data.status]);
   }
-  closeForm();render();
+  closeForm();render();saveCloud();
 });
 
 /* ---- AI suggestion generator (on-device templates) ---- */
@@ -492,12 +502,57 @@ document.getElementById("importFile").addEventListener("change",function(e){
       var list=Array.isArray(data)?data:data.videos;
       if(!Array.isArray(list))throw new Error("bad");
       list.forEach(function(v){v.id=nextId++;v.tags=v.tags||[];v.status=["upcoming","progress","done"].indexOf(v.status)>-1?v.status:"upcoming";v.platform=v.platform||"youtube";videos.push(v)});
-      render();toast("Imported "+list.length+" video"+(list.length===1?"":"s"));
+      render();saveCloud();toast("Imported "+list.length+" video"+(list.length===1?"":"s"));
     }catch(err){toast("That file doesn't look like a HUB backup")}
     e.target.value="";
   };
   reader.readAsText(file);
 });
+
+/* ---- Cloud database (Firebase: same inventory on every device) ---- */
+var cloudDoc=null, saveTimer=null, dirty=false;
+function setSync(state,text){
+  var pill=document.getElementById("syncPill");
+  if(!pill)return;
+  pill.className="sync-pill "+state;
+  document.getElementById("syncText").textContent=text;
+}
+function maxId(){return videos.reduce(function(m,v){return Math.max(m,v.id||0)},0)}
+function saveCloud(){
+  if(!cloudDoc)return;
+  dirty=true;setSync("syncing","Saving…");
+  clearTimeout(saveTimer);
+  saveTimer=setTimeout(function(){
+    cloudDoc.set({videos:videos,nextId:nextId,updatedAt:firebase.firestore.FieldValue.serverTimestamp()}).then(function(){
+      dirty=false;setSync("synced","Synced ✓");
+    }).catch(function(){setSync("offline","Offline — will retry");});
+  },700);
+}
+try{
+  firebase.initializeApp({
+    apiKey:"AIzaSyDRrfx8q0U_0cvwwxSOjwmgfNrm--qqx-w",
+    authDomain:"video-inventory-hub.firebaseapp.com",
+    projectId:"video-inventory-hub",
+    storageBucket:"video-inventory-hub.firebasestorage.app",
+    messagingSenderId:"307687553762",
+    appId:"1:307687553762:web:0aca59feb878ad0ceabcbb"
+  });
+  var db=firebase.firestore();
+  setSync("syncing","Connecting…");
+  firebase.auth().signInAnonymously().then(function(){
+    cloudDoc=db.collection("hubs").doc("main");
+    cloudDoc.onSnapshot(function(snap){
+      if(dirty){saveCloud();return;} // local edits pending: push ours instead of taking theirs
+      if(snap.exists()){
+        var d=snap.data()||{};
+        if(Array.isArray(d.videos)){videos=d.videos;nextId=d.nextId||(maxId()+1);render();}
+      }else{
+        saveCloud(); // first run: upload the starter inventory
+      }
+      setSync("synced","Synced ✓");
+    },function(){setSync("offline","Offline — changes stay on this device");});
+  }).catch(function(){setSync("offline","Offline — changes stay on this device");});
+}catch(e){setSync("offline","Sync unavailable");}
 
 render();
 </script>
