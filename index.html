@@ -590,6 +590,13 @@ function initCloud(collection,docId){
   },function(){setSync("offline","Offline — changes stay on this device");});
 }
 var lockMode="unlock";
+function ensureAnon(){
+  try{
+    if(firebase.auth().currentUser)return Promise.resolve(firebase.auth().currentUser);
+    return firebase.auth().signInAnonymously();
+  }catch(e){return Promise.reject(e)}
+}
+try{ensureAnon().catch(function(){})}catch(e){} // warm up auth so database reads never run unauthenticated
 function sha256hex(s){
   return crypto.subtle.digest("SHA-256",new TextEncoder().encode("video-hub:"+s)).then(function(buf){
     return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0")}).join("");
@@ -629,30 +636,29 @@ document.getElementById("unlockBtn").addEventListener("click",function(){
   var trusted=document.getElementById("trustDevice").checked;
   sha256hex(pin).then(function(hash){
     var docId="p-"+hash;
-    if(lockMode==="setup"){
-      db.collection("pin").doc(docId).get().then(function(snap){
-        if(snap.exists()){btn.disabled=false;lockError("That PIN is already in use — pick a different one");return}
-        var mainRef=db.collection("hubs").doc("main");
-        mainRef.get().then(function(mainSnap){
-          var payload={videos:videos,nextId:nextId};
-          if(mainSnap.exists()&&Array.isArray(mainSnap.data().videos)){
-            payload.videos=mainSnap.data().videos;
-            payload.nextId=mainSnap.data().nextId||payload.nextId;
-          }
-          payload.updatedAt=firebase.firestore.FieldValue.serverTimestamp();
-          db.collection("pin").doc(docId).set(payload).then(function(){
-            mainRef.delete().catch(function(){});
-            btn.disabled=false;doUnlock(docId);
-          }).catch(function(){btn.disabled=false;lockError("Couldn't save — check your connection")});
-        }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
-      }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
-    }else{
-      db.collection("pin").doc(docId).get().then(function(snap){
-        btn.disabled=false;
-        if(snap.exists())doUnlock(docId);
-        else lockError("Wrong PIN — try again");
-      }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
-    }
+    ensureAnon().then(function(){
+      if(lockMode==="setup"){
+        return db.collection("pin").doc(docId).get().then(function(snap){
+          if(snap.exists()){btn.disabled=false;lockError("That PIN is already in use — pick a different one");return}
+          return db.collection("hubs").doc("main").get().then(function(mainSnap){
+            return (mainSnap.exists()&&Array.isArray(mainSnap.data().videos))?mainSnap.data():null;
+          }).catch(function(){return null}).then(function(mainData){
+            var payload={videos:videos,nextId:nextId,updatedAt:firebase.firestore.FieldValue.serverTimestamp()};
+            if(mainData){payload.videos=mainData.videos;payload.nextId=mainData.nextId||payload.nextId}
+            return db.collection("pin").doc(docId).set(payload).then(function(){
+              db.collection("hubs").doc("main").delete().catch(function(){});
+              btn.disabled=false;doUnlock(docId);
+            });
+          });
+        });
+      }else{
+        return db.collection("pin").doc(docId).get().then(function(snap){
+          btn.disabled=false;
+          if(snap.exists())doUnlock(docId);
+          else lockError("Wrong PIN — try again");
+        });
+      }
+    }).catch(function(){btn.disabled=false;lockError("Couldn't reach the database — check your connection")});
   });
 });
 /* ---- Continue with Google ---- */
@@ -691,12 +697,16 @@ try{
   firebase.auth().getRedirectResult().then(function(){},function(){lockError("Google sign-in didn't finish — please try again")});
 }catch(e){}
 document.getElementById("lockBtn").addEventListener("click",function(){
+  function done(){location.reload()}
   try{
     sessionStorage.removeItem("hubDoc");localStorage.removeItem("hubDoc");
     localStorage.removeItem("hubAuth");
-    firebase.auth().signOut().catch(function(){});
-  }catch(e){}
-  location.reload();
+    if(!db){done();return}
+    var finished=false;
+    function once(){if(!finished){finished=true;done()}}
+    firebase.auth().signOut().then(once).catch(once);
+    setTimeout(once,2500);
+  }catch(e){done()}
 });
 (function(){
   var remembered=null,authMode=null;
@@ -706,7 +716,10 @@ document.getElementById("lockBtn").addEventListener("click",function(){
   }catch(e){}
   if(!db)return;
   if(authMode==="google"){setSync("syncing","Restoring sign-in…");return}
-  if(remembered){hideLock();initCloud("pin",remembered)}
+  if(remembered){
+    hideLock();
+    ensureAnon().then(function(){initCloud("pin",remembered)}).catch(function(){setSync("offline","Couldn't start a secure session — reload")});
+  }
 })();
 
 render();
