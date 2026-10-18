@@ -596,7 +596,6 @@ function ensureAnon(){
     return firebase.auth().signInAnonymously();
   }catch(e){return Promise.reject(e)}
 }
-try{ensureAnon().catch(function(){})}catch(e){} // warm up auth so database reads never run unauthenticated
 function sha256hex(s){
   return crypto.subtle.digest("SHA-256",new TextEncoder().encode("video-hub:"+s)).then(function(buf){
     return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0")}).join("");
